@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Ranked output contains personal data in the clear. Never commit it.
+ranking.csv
+ranking.json
+*.ranking.csv
+*.ranking.json
