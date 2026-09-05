@@ -50,6 +50,7 @@ import sys
 import tempfile
 import urllib.parse
 from collections import defaultdict
+from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from glob import glob
@@ -118,8 +119,15 @@ ROLE_DOMAIN = re.compile(
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+@lru_cache(maxsize=200_000)
 def norm_email(raw: Optional[str]) -> Optional[str]:
-    """Canonical key for an email address, or None if it is not one."""
+    """
+    Canonical key for an email address, or None if it is not one.
+
+    Memoised: a large mailbox yields millions of recipient rows drawn from only
+    tens of thousands of distinct addresses, so almost all of this work is
+    repeated. The cache turns the dominant cost of a run into a dict lookup.
+    """
     if not raw:
         return None
     # "Name <addr@host>" and '"Name" <addr@host>' -> "addr@host". This has to
@@ -135,9 +143,10 @@ def norm_email(raw: Optional[str]) -> Optional[str]:
     return "mailto:" + s
 
 
+@lru_cache(maxsize=200_000)
 def norm_phone(raw: Optional[str]) -> Optional[str]:
     """
-    Canonical key for a phone number.
+    Canonical key for a phone number. Memoised, as above.
 
     We deliberately key on the last nine significant digits rather than on a
     fully-qualified E.164 number. Local stores mix +39 02..., 0039 02...,
@@ -420,48 +429,71 @@ def count_rows(conn: sqlite3.Connection, table: str) -> Optional[int]:
 # Source discovery
 # --------------------------------------------------------------------------
 
-def find_mail_dbs() -> List[Path]:
-    return [Path(p) for p in sorted(glob(str(HOME / "Library/Mail/V*/MailData/Envelope Index")))]
-
-
-def find_addressbook_dbs() -> List[Path]:
-    base = HOME / "Library/Application Support/AddressBook"
-    found = []
-    top = base / "AddressBook-v22.abcddb"
-    if top.exists():
-        found.append(top)
-    found += [Path(p) for p in sorted(glob(str(base / "Sources/*/AddressBook-v22.abcddb")))]
-    return found
-
-
-def find_messages_db() -> List[Path]:
-    p = HOME / "Library/Messages/chat.db"
-    return [p] if p.exists() else []
-
-
-def find_callhistory_db() -> List[Path]:
-    p = HOME / "Library/Application Support/CallHistoryDB/CallHistory.storedata"
-    return [p] if p.exists() else []
-
-
-def find_calendar_db() -> List[Path]:
-    p = HOME / "Library/Calendars/Calendar.sqlitedb"
-    return [p] if p.exists() else []
-
-
-def find_coreduet_db() -> List[Path]:
-    p = HOME / "Library/Application Support/CoreDuet/People/interactionC.db"
-    return [p] if p.exists() else []
-
-
-SOURCES = {
-    "mail": find_mail_dbs,
-    "imessage": find_messages_db,
-    "call": find_callhistory_db,
-    "calendar": find_calendar_db,
-    "contacts": find_addressbook_dbs,
-    "coreduet": find_coreduet_db,
+# Where each store lives, as glob patterns relative to the home directory.
+#
+# Apple moves these between releases: Calendar migrated into a group container,
+# Mail's version directory changes every few majors. So each store is a list of
+# candidates tried in order, and `probe` reports what it searched when it finds
+# nothing -- a wrong guess should be visible, not silent.
+SEARCH_PATHS = {
+    "mail": [
+        "Library/Mail/V*/MailData/Envelope Index",
+    ],
+    "imessage": [
+        "Library/Messages/chat.db",
+    ],
+    "call": [
+        "Library/Application Support/CallHistoryDB/CallHistory.storedata",
+    ],
+    "calendar": [
+        # Sonoma and later; the old location is kept below for earlier systems.
+        "Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb",
+        "Library/Calendars/Calendar.sqlitedb",
+        "Library/Containers/com.apple.CalendarAgent/Data/Library/Calendars/Calendar.sqlitedb",
+        "Library/Group Containers/*/Calendar.sqlitedb",
+    ],
+    "contacts": [
+        "Library/Application Support/AddressBook/AddressBook-v22.abcddb",
+        "Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb",
+    ],
+    "coreduet": [
+        "Library/Application Support/CoreDuet/People/interactionC.db",
+        "Library/Group Containers/*/CoreDuet/People/interactionC.db",
+    ],
 }
+
+
+def natural_key(text: str) -> List[object]:
+    """Sort V9 before V10. Lexicographic order puts V10 first, which would make
+    'the newest version directory' select the oldest one."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(text))]
+
+
+def find_dbs(store: str) -> List[Path]:
+    """
+    Resolve a store to the databases actually present.
+
+    `contacts` is the one store where several files are genuinely different
+    accounts and all of them count. Everywhere else a second match means a copy
+    left behind by a macOS upgrade -- two Mail version directories, a Calendar
+    store in both its old and new home -- and reading both would count every
+    interaction twice. So contacts takes everything; the rest take the newest
+    match of the first pattern that hits.
+    """
+    if store == "contacts":
+        found: List[Path] = []
+        for pattern in SEARCH_PATHS[store]:
+            found += sorted((Path(p) for p in glob(str(HOME / pattern))), key=natural_key)
+        return found
+    for pattern in SEARCH_PATHS[store]:
+        found = sorted((Path(p) for p in glob(str(HOME / pattern))), key=natural_key)
+        if found:
+            return found[-1:]
+    return []
+
+
+def searched_paths(store: str) -> List[str]:
+    return [str(HOME / pattern) for pattern in SEARCH_PATHS[store]]
 
 
 # --------------------------------------------------------------------------
@@ -786,16 +818,25 @@ def extract_cards(paths: Sequence[Path]) -> List[Card]:
                             if "linkedin.com" in u.lower() and not c.linkedin:
                                 c.linkedin = u
 
-                images = set()
+                # Contact photographs are files beside the store, named by the
+                # record's UUID. Index them by every plausible key first: the
+                # naive prefix scan is O(records x images), which on a real
+                # address book of 80,000 records is a quarter of a billion
+                # string comparisons.
+                image_keys: Set[str] = set()
                 img_dir = path.parent / "Images"
                 if img_dir.is_dir():
                     try:
-                        images = {p.name for p in img_dir.iterdir()}
+                        for name in (q.name for q in img_dir.iterdir()):
+                            image_keys.add(name)
+                            image_keys.add(name.split(":")[0])
+                            if len(name) >= 36:
+                                image_keys.add(name[:36])
                     except OSError:
-                        images = set()
-                for c in by_pk.values():
-                    stem = c.uid.split(":")[0]
-                    c.has_image = any(n.startswith(stem) for n in images)
+                        pass
+                if image_keys:
+                    for c in by_pk.values():
+                        c.has_image = c.uid.split(":")[0] in image_keys
 
                 cards.extend(c for c in by_pk.values() if c.emails or c.phones or c.name)
         except SourceError:
@@ -1002,11 +1043,13 @@ def cmd_probe(args: argparse.Namespace) -> int:
         print("NOTE: this is not macOS (%s). Paths below will not exist here;\n"
               "      run this on the Mac whose contacts you want to rank.\n" % sys.platform)
     any_blocked = False
-    for name, finder in SOURCES.items():
-        paths = finder()
+    for name in SEARCH_PATHS:
+        paths = find_dbs(name)
         print("[%s] %s" % (name, PROBE_HINTS[name]))
         if not paths:
-            print("    - not present")
+            print("    - not present. Searched:")
+            for pattern in searched_paths(name):
+                print("        %s" % pattern)
             print()
             continue
         for path in paths:
@@ -1020,7 +1063,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
                         "messages", "addresses", "recipients", "mailboxes",
                         "message", "handle", "chat", "chat_message_join",
                         "ZCALLRECORD", "CalendarItem", "Participant",
-                        "ZABCDRECORD", "ZABCDEMAILADDRESS", "ZABCDSOCIALPROFILE",
+                        "ZABCDRECORD", "ZABCDEMAILADDRESS", "ZABCDPHONENUMBER",
+                        "ZABCDSOCIALPROFILE",
                         "ZINTERACTIONS", "ZCONTACTS")]
                     print("    + %s" % path)
                     print("      %d tables; relevant: %s" % (
@@ -1059,22 +1103,22 @@ def gather(args: argparse.Namespace, now: float) -> Tuple[List[Event], List[Card
             notes.append("%-9s skipped: %s" % (name, exc))
 
     if "mail" in wanted:
-        for p in find_mail_dbs():
+        for p in find_dbs("mail"):
             collect("mail", extract_mail(p, since_ts, own))
     if "imessage" in wanted:
-        for p in find_messages_db():
+        for p in find_dbs("imessage"):
             collect("imessage", extract_imessage(p, since_ts))
     if "call" in wanted:
-        for p in find_callhistory_db():
+        for p in find_dbs("call"):
             collect("call", extract_call(p, since_ts))
     if "calendar" in wanted:
-        for p in find_calendar_db():
+        for p in find_dbs("calendar"):
             collect("calendar", extract_calendar(p, since_ts))
     if "coreduet" in wanted:
-        for p in find_coreduet_db():
+        for p in find_dbs("coreduet"):
             collect("coreduet", extract_coreduet(p, since_ts))
 
-    cards = extract_cards(find_addressbook_dbs())
+    cards = extract_cards(find_dbs("contacts"))
     notes.append("%-9s %7d cards" % ("contacts", len(cards)))
     return events, cards, notes
 
@@ -1159,10 +1203,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
     say()
 
     say("stores")
-    for name, finder in SOURCES.items():
-        paths = finder()
+    for name in SEARCH_PATHS:
+        paths = find_dbs(name)
         if not paths:
-            say("  %-10s not present" % name)
+            say("  %-10s not present; searched %d location(s)"
+                % (name, len(SEARCH_PATHS[name])))
             continue
         for path in paths:
             try:
@@ -1183,6 +1228,15 @@ def cmd_stats(args: argparse.Namespace) -> int:
     say("sources")
     for line in notes:
         say("  " + line)
+    say()
+
+    say("address book")
+    say("  %-24s %6d" % ("cards", len(cards)))
+    say("  %-24s %6d" % ("with an email", sum(1 for c in cards if c.emails)))
+    say("  %-24s %6d" % ("with a phone", sum(1 for c in cards if c.phones)))
+    say("  %-24s %6d" % ("with a photo", sum(1 for c in cards if c.has_image)))
+    say("  %-24s %6d   <- the Stage B head start"
+        % ("with a LinkedIn URL", sum(1 for c in cards if c.linkedin)))
     say()
 
     role = {e.key for e in events if is_role_address(e.key)}
