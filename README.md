@@ -39,3 +39,5 @@ Proposal 0001 §5 sets out where each comes from.
 4. Never evade a technical control. A challenge stops the run.
 5. Every stored record carries provenance, a timestamp, a TTL and a working erase.
 6. Nothing leaves the machine without an explicit, per-destination decision.
+7. Never overwrite what is already there. An existing contact photo is skipped,
+   not upgraded; nothing is written to the address book as a side effect.

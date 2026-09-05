@@ -288,6 +288,38 @@ choice stays visible rather than implicit:
   it is left alone, so the confidence threshold is calibrated against real
   matches rather than guessed.
 
+### 4.6 Non-destructive by construction
+
+**An existing photograph is never replaced.** Not upgraded to a higher
+resolution, not refreshed because it looks old, not touched at all. A contact
+who already has an image is removed from the queue before any fetching is
+considered, and the enrichment run has no code path that could write over one.
+
+Two mechanisms, because the rule is worth more than a check:
+
+**Nothing is written to the address book as a side effect.** Enrichment lands in
+Orditura's own store — image bytes plus provenance, confidence and timestamp.
+Applying it to Contacts is a separate, explicit action with its own review, and
+it keeps a ledger of what was written and when so it can be undone. This matters
+more than it sounds: a card synced to iCloud propagates a write to every device
+and to anyone the card is shared with, and there is no undo at that layer.
+
+**"Already has an image" is answered in three tiers, and only a unanimous
+negative permits a fetch:**
+
+| Tier | Source | Authority |
+|---|---|---|
+| 1 | `CNContactImageDataAvailableKey` on the **unified** contact | Authoritative. Cheap — it does not load the bytes |
+| 2 | Linked cards across accounts, via `unifiedContacts(matching:)` | Catches a photo supplied by another account on the same person |
+| 3 | The `Images/` directory beside the address-book store | What `has_photo` reports today. Fast, and usable without the Contacts permission |
+
+Tier 3 alone is not enough, and the failure is asymmetric: a positive is
+reliable, a negative is not. A photo arriving from iCloud, from a linked card in
+another account, or from a directory service can display in Contacts without a
+file in that directory — so trusting tier 3's negative is exactly how you would
+overwrite a photograph you already had. Treat it as a fast pre-filter, and gate
+the fetch on tier 1.
+
 ---
 
 ## 5. Legal and regulatory analysis (EU)
@@ -412,6 +444,10 @@ These are constraints on the implementation, not aspirations:
 5. **Every stored record carries provenance, a retrieval timestamp, a retention
    TTL and a one-click erase** that actually deletes the bytes.
 6. **Nothing leaves the machine** without an explicit, per-destination decision.
+7. **Never overwrite what is already there.** A contact with an existing
+   photograph is skipped, not upgraded. Nothing is written to the address book
+   as a side effect: enrichment lands in a sidecar store, and applying it is a
+   separate, explicit, reversible action. (§4.6)
 
 ---
 
