@@ -48,6 +48,11 @@ public struct RankingOptions {
     public var halfLifeDays: Double
     public var minimumActiveDays: Int
     public var dropRoleAddresses: Bool
+    /// Drop senders you never write back to. See `Ranker.isBroadcaster`.
+    public var dropBroadcasters: Bool
+    /// Merge people who appear twice under different addresses. Off by default:
+    /// see `likelyDuplicates`.
+    public var fuseByName: Bool
     public var includeCoreDuet: Bool
     /// Meetings above this size are ignored: an all-hands is not a relationship.
     public var maximumAttendees: Int
@@ -56,12 +61,16 @@ public struct RankingOptions {
                 halfLifeDays: Double = Scoring.defaultHalfLifeDays,
                 minimumActiveDays: Int = 3,
                 dropRoleAddresses: Bool = true,
+                dropBroadcasters: Bool = true,
+                fuseByName: Bool = false,
                 includeCoreDuet: Bool = false,
                 maximumAttendees: Int = 25) {
         self.window = windowDays * 86_400
         self.halfLifeDays = halfLifeDays
         self.minimumActiveDays = minimumActiveDays
         self.dropRoleAddresses = dropRoleAddresses
+        self.dropBroadcasters = dropBroadcasters
+        self.fuseByName = fuseByName
         self.includeCoreDuet = includeCoreDuet
         self.maximumAttendees = maximumAttendees
     }
@@ -136,11 +145,28 @@ public enum Ranker {
             people[root]?.card = keys.sorted().compactMap { cardByIdentity[$0] }.first
         }
 
-        return people.values
+        let ranked = people.values
             .filter { keep($0, options: options) }
             .sorted { a, b in
                 a.score == b.score ? a.name < b.name : a.score > b.score
             }
+        return options.fuseByName ? fuseByName(ranked) : ranked
+    }
+
+    /// Someone you have never written to — or write to less than once in twenty
+    /// — is a broadcaster, however much they send you.
+    ///
+    /// Structural rather than lexical, which is the point: a keyword list only
+    /// ever catches the senders someone thought of, and every newsletter that
+    /// slips through does so because its address looks like a person's. Volume
+    /// of inbound mail is not evidence of a relationship; a reply is. A call or
+    /// a meeting overrides it outright.
+    static func isBroadcaster(_ person: Person) -> Bool {
+        if person.meetings > 0 || person.calls > 0 { return false }
+        if person.sent == 0 && person.received >= 5 { return true }
+        if person.received >= 20,
+           Double(person.sent) / Double(person.received) < 0.05 { return true }
+        return false
     }
 
     /// Drop one-shot bursts. A tie is evidenced by recurrence across distinct
@@ -148,7 +174,8 @@ public enum Ranker {
     /// which is strong enough on its own. Kept as a filter rather than folded
     /// into the score, so that exclusions stay auditable.
     static func keep(_ person: Person, options: RankingOptions) -> Bool {
-        person.activeDays >= options.minimumActiveDays
+        if options.dropBroadcasters && isBroadcaster(person) { return false }
+        return person.activeDays >= options.minimumActiveDays
             || person.meetings > 0
             || person.calls > 0
     }

@@ -81,12 +81,21 @@ public enum ContactsExtractor {
         // enrichment queue: these people need nothing fetched.
         let imageDirectory = url.deletingLastPathComponent()
             .appendingPathComponent("Images", isDirectory: true)
-        let imageNames = Set(
-            (try? FileManager.default.contentsOfDirectory(atPath: imageDirectory.path)) ?? [])
-        if !imageNames.isEmpty {
+        // Index the directory by every plausible key first. A prefix scan is
+        // O(records x images), which on a real address book of 80,000 records
+        // against a few thousand files is a quarter of a billion comparisons.
+        var imageKeys = Set<String>()
+        let names = (try? FileManager.default
+            .contentsOfDirectory(atPath: imageDirectory.path)) ?? []
+        for name in names {
+            imageKeys.insert(name)
+            if let head = name.components(separatedBy: ":").first { imageKeys.insert(head) }
+            if name.count >= 36 { imageKeys.insert(String(name.prefix(36))) }
+        }
+        if !imageKeys.isEmpty {
             for (pk, card) in byKey {
                 let stem = card.uid.components(separatedBy: ":").first ?? card.uid
-                byKey[pk]?.hasImage = imageNames.contains { $0.hasPrefix(stem) }
+                byKey[pk]?.hasImage = imageKeys.contains(stem)
             }
         }
 

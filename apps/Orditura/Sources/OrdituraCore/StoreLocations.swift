@@ -54,53 +54,81 @@ public enum StoreLocations {
         URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
     }
 
-    public static func urls(for store: Store, home: URL = StoreLocations.home) -> [URL] {
+    /// Sort V9 before V10. Lexicographic order puts V10 first, which would make
+    /// "the newest version directory" select the oldest one.
+    static func naturalLess(_ a: String, _ b: String) -> Bool {
+        a.compare(b, options: .numeric) == .orderedAscending
+    }
+
+    private static func children(of directory: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(at: directory,
+                                                      includingPropertiesForKeys: nil)) ?? []
+    }
+
+    /// Candidate locations for a store, newest convention first.
+    ///
+    /// Apple moves these between releases — Calendar migrated into a group
+    /// container, Mail's version directory changes every few majors — so each
+    /// store is a list tried in order, and the access probe reports what it
+    /// searched when nothing matches. A wrong guess about an undocumented
+    /// location should be visible, not silent.
+    public static func candidates(for store: Store, home: URL = StoreLocations.home) -> [URL] {
         let library = home.appendingPathComponent("Library", isDirectory: true)
         let appSupport = library.appendingPathComponent("Application Support", isDirectory: true)
-        let fm = FileManager.default
-
-        func existing(_ url: URL) -> [URL] {
-            fm.fileExists(atPath: url.path) ? [url] : []
-        }
+        let groups = library.appendingPathComponent("Group Containers", isDirectory: true)
 
         switch store {
         case .mail:
-            // The container version changes with macOS: V9, V10, V11…
-            let mail = library.appendingPathComponent("Mail", isDirectory: true)
-            guard let versions = try? fm.contentsOfDirectory(
-                at: mail, includingPropertiesForKeys: nil) else { return [] }
-            return versions
+            return children(of: library.appendingPathComponent("Mail", isDirectory: true))
                 .filter { $0.lastPathComponent.hasPrefix("V") }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
-                .flatMap { existing($0.appendingPathComponent("MailData/Envelope Index")) }
+                .sorted { naturalLess($0.lastPathComponent, $1.lastPathComponent) }
+                .map { $0.appendingPathComponent("MailData/Envelope Index") }
 
         case .imessage:
-            return existing(library.appendingPathComponent("Messages/chat.db"))
+            return [library.appendingPathComponent("Messages/chat.db")]
 
         case .call:
-            return existing(appSupport.appendingPathComponent(
-                "CallHistoryDB/CallHistory.storedata"))
+            return [appSupport.appendingPathComponent("CallHistoryDB/CallHistory.storedata")]
 
         case .calendar:
-            return existing(library.appendingPathComponent("Calendars/Calendar.sqlitedb"))
+            return [
+                // Sonoma and later; the earlier location follows for older systems.
+                groups.appendingPathComponent("group.com.apple.calendar/Calendar.sqlitedb"),
+                library.appendingPathComponent("Calendars/Calendar.sqlitedb"),
+                library.appendingPathComponent(
+                    "Containers/com.apple.CalendarAgent/Data/Library/Calendars/Calendar.sqlitedb"),
+            ] + children(of: groups)
+                .sorted { naturalLess($0.lastPathComponent, $1.lastPathComponent) }
+                .map { $0.appendingPathComponent("Calendar.sqlitedb") }
 
         case .contacts:
-            // The top-level database plus one per configured account source.
             let base = appSupport.appendingPathComponent("AddressBook", isDirectory: true)
-            var found = existing(base.appendingPathComponent("AddressBook-v22.abcddb"))
-            let sources = base.appendingPathComponent("Sources", isDirectory: true)
-            if let dirs = try? fm.contentsOfDirectory(at: sources,
-                                                      includingPropertiesForKeys: nil) {
-                for dir in dirs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-                    found += existing(dir.appendingPathComponent("AddressBook-v22.abcddb"))
-                }
-            }
-            return found
+            return [base.appendingPathComponent("AddressBook-v22.abcddb")]
+                + children(of: base.appendingPathComponent("Sources", isDirectory: true))
+                    .sorted { naturalLess($0.lastPathComponent, $1.lastPathComponent) }
+                    .map { $0.appendingPathComponent("AddressBook-v22.abcddb") }
 
         case .coreduet:
-            return existing(appSupport.appendingPathComponent(
-                "CoreDuet/People/interactionC.db"))
+            return [appSupport.appendingPathComponent("CoreDuet/People/interactionC.db")]
+                + children(of: groups)
+                    .map { $0.appendingPathComponent("CoreDuet/People/interactionC.db") }
         }
+    }
+
+    /// The databases actually present.
+    ///
+    /// Contacts is the one store where several files are genuinely different
+    /// accounts and all of them count. Everywhere else a second match means a
+    /// copy left behind by a macOS upgrade — two Mail version directories, a
+    /// Calendar store in both its old and new home — and reading both would
+    /// count every interaction twice. So contacts takes everything; the rest
+    /// take the newest match only.
+    public static func urls(for store: Store, home: URL = StoreLocations.home) -> [URL] {
+        let fm = FileManager.default
+        let present = candidates(for: store, home: home)
+            .filter { fm.fileExists(atPath: $0.path) }
+        if store == .contacts { return present }
+        return present.last.map { [$0] } ?? []
     }
 }
 

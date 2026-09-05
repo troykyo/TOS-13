@@ -173,6 +173,100 @@ class TestScoringModel(unittest.TestCase):
         self.assertEqual([p.root for p in kept], ["b", "c"])
 
 
+class TestBroadcasterDetection(unittest.TestCase):
+    """
+    The cases that got past the keyword list on a real mailbox. Keyword lists
+    only ever catch the senders someone thought of, which is why the rule that
+    actually does the work here is structural: a reply is evidence, inbound
+    volume is not.
+    """
+
+    def person(self, out, incoming, meetings=0, calls=0):
+        p = cr.Person(root="mailto:x@y.zz")
+        p.n_out, p.n_in, p.n_meet, p.n_call = out, incoming, meetings, calls
+        return p
+
+    def test_never_written_to_is_a_broadcaster(self):
+        for out, incoming in [(0, 4627), (0, 2018), (0, 1577), (0, 1284)]:
+            self.assertTrue(cr.is_broadcaster(self.person(out, incoming)))
+
+    def test_replying_less_than_once_in_twenty_is_a_broadcaster(self):
+        self.assertTrue(cr.is_broadcaster(self.person(5, 405)))
+
+    def test_real_correspondents_survive(self):
+        for out, incoming in [(117, 354), (49, 156), (148, 274), (86, 139),
+                              (18546, 8272), (2241, 11)]:
+            self.assertFalse(cr.is_broadcaster(self.person(out, incoming)),
+                             "%d/%d" % (out, incoming))
+
+    def test_a_call_or_meeting_overrides_it(self):
+        self.assertFalse(cr.is_broadcaster(self.person(0, 900, meetings=1)))
+        self.assertFalse(cr.is_broadcaster(self.person(0, 900, calls=1)))
+
+    def test_a_handful_of_inbound_is_not_yet_evidence_either_way(self):
+        self.assertFalse(cr.is_broadcaster(self.person(0, 4)))
+
+    def test_role_tokens_are_matched_anywhere_in_the_local_part(self):
+        for bad in ["scholaralerts-noreply@google.com", "jobalerts-noreply@linkedin.com",
+                    "news-noreply@dezeen.com", "team+notifications@x.io"]:
+            self.assertTrue(cr.is_role_address(cr.norm_email(bad)), bad)
+        # ...but never inside a name.
+        for good in ["j.news@tue.nl", "borre@byborre.com", "alberto.digest@studio.it"]:
+            self.assertFalse(cr.is_role_address(cr.norm_email(good)), good)
+
+    def test_filter_drops_broadcasters_unless_asked_not_to(self):
+        news = self.person(0, 900); news.days = set(range(30))
+        real = self.person(120, 300); real.days = set(range(30))
+        self.assertEqual(cr.filter_people([news, real], 3), [real])
+        self.assertEqual(len(cr.filter_people([news, real], 3, drop_broadcasters=False)), 2)
+
+
+class TestDuplicateDetection(unittest.TestCase):
+    def person(self, name, score):
+        # The score disambiguates the address: two people with the same name
+        # must have *different* identities, or the fixture would not model the
+        # situation being tested -- one person split across two addresses.
+        key = "mailto:%s+%d@x.it" % (name.replace(" ", ".").lower(), score)
+        p = cr.Person(root=key)
+        p.displays[name] = 1
+        p.out_score = p.in_score = score
+        p.keys = {key}
+        return p
+
+    def test_identical_names_group(self):
+        people = [self.person("Andre Neumann", 90), self.person("Andre Neumann", 40),
+                  self.person("Oscar Tomico", 200)]
+        groups = cr.likely_duplicates(people)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 2)
+
+    def test_one_name_extending_another_groups(self):
+        """A double surname added later is the common shape, and an exact
+        match cannot see it."""
+        people = [self.person("Bruna Goveia", 55),
+                  self.person("Bruna Goveia da Rocha", 32)]
+        self.assertEqual(len(cr.likely_duplicates(people)), 1)
+
+    def test_a_first_name_alone_never_groups(self):
+        people = [self.person("Anna", 10), self.person("Anna Rossi", 10),
+                  self.person("Anna Bianchi", 10)]
+        self.assertEqual(cr.likely_duplicates(people), [])
+
+    def test_accents_and_case_do_not_split_a_person(self):
+        people = [self.person("José Teunissen", 40), self.person("jose teunissen", 20)]
+        self.assertEqual(len(cr.likely_duplicates(people)), 1)
+
+    def test_fusion_combines_scores_and_identities(self):
+        people = [self.person("Andre Neumann", 90), self.person("Andre Neumann", 40),
+                  self.person("Oscar Tomico", 200)]
+        fused = cr.fuse_by_name(people)
+        self.assertEqual(len(fused), 2)
+        andre = next(p for p in fused if p.best_display == "Andre Neumann")
+        self.assertEqual(andre.volume, 260.0)
+        self.assertEqual(len(andre.keys), 2)  # both addresses now belong to him
+        self.assertEqual(fused[0].best_display, "Oscar Tomico")
+
+
 # ---------------------------------------------------------------------------
 # Extractors, against schema-shaped fixtures
 # ---------------------------------------------------------------------------

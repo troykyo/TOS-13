@@ -48,6 +48,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import unicodedata
 import urllib.parse
 from collections import defaultdict
 from functools import lru_cache
@@ -97,6 +98,23 @@ ROLE_LOCALPART = re.compile(
     r"careers|jobs|recruiting|hr|"
     r"updates?|digest|feedback|survey|events?|calendar-notification"
     r")([+._-].*)?$",
+    re.IGNORECASE,
+)
+
+# An unambiguous machine token appearing anywhere in the local part, bounded by
+# a delimiter. The anchored pattern above only matches a local part that *is* a
+# role name; real bulk senders prefix it -- scholaralerts-noreply, jobalerts-
+# noreply, news-noreply. Deliberately narrower than the list above, because this
+# one can match inside a name and must not.
+# Only tokens that can never be part of a person's name. "alerts", "newsletter"
+# and "digest" were here and were removed: they can sit inside one, and the
+# structural broadcaster rule catches those senders anyway without the risk.
+# When a lexical rule and a structural one overlap, keep the structural one.
+ROLE_TOKEN_ANYWHERE = re.compile(
+    r"(^|[.\-_+])("
+    r"no-?reply|do-?not-?reply|donotreply|noreply|"
+    r"mailer-daemon|postmaster|bounce[s]?|notification[s]?"
+    r")([.\-_+]|$)",
     re.IGNORECASE,
 )
 
@@ -186,6 +204,8 @@ def is_role_address(key: str) -> bool:
     addr = key[len("mailto:"):]
     local, _, domain = addr.partition("@")
     if ROLE_LOCALPART.match(local):
+        return True
+    if ROLE_TOKEN_ANYWHERE.search(local):
         return True
     if ROLE_DOMAIN.search(domain):
         return True
@@ -930,7 +950,28 @@ def aggregate(
     return sorted(people.values(), key=lambda x: (-x.score, x.best_display))
 
 
-def filter_people(people: Sequence[Person], min_active_days: int) -> List[Person]:
+def is_broadcaster(p: Person) -> bool:
+    """
+    Someone you have never written to -- or write to less than once in twenty --
+    is a broadcaster, however much they send you.
+
+    This is structural rather than lexical, which is the point: keyword lists
+    only ever catch the senders someone thought of, and every real newsletter
+    that slipped through the list did so because its address looked like a
+    person's. Volume of inbound mail is not evidence of a relationship; a reply
+    is. A call or a meeting overrides it outright.
+    """
+    if p.n_meet or p.n_call:
+        return False
+    if p.n_out == 0 and p.n_in >= 5:
+        return True
+    if p.n_in >= 20 and (p.n_out / float(p.n_in)) < 0.05:
+        return True
+    return False
+
+
+def filter_people(people: Sequence[Person], min_active_days: int,
+                  drop_broadcasters: bool = True) -> List[Person]:
     """
     Drop one-shot bursts. A tie is evidenced by recurrence over distinct days,
     not by a single busy afternoon -- except where a meeting or a phone call
@@ -938,9 +979,86 @@ def filter_people(people: Sequence[Person], min_active_days: int) -> List[Person
     """
     out = []
     for p in people:
+        if drop_broadcasters and is_broadcaster(p):
+            continue
         if len(p.days) >= min_active_days or p.n_meet > 0 or p.n_call > 0:
             out.append(p)
     return out
+
+
+def fold_name(name: str) -> str:
+    """Case-, accent- and spacing-insensitive form of a display name."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(stripped.lower().split())
+
+
+def likely_duplicates(people: Sequence[Person]) -> List[List[Person]]:
+    """
+    People who look like one person split across two identities.
+
+    Identity fusion only merges what a single address-book card links together,
+    so someone who writes from a second address that is not on their card
+    appears twice, with their tie strength divided between the halves. The two
+    shapes this takes in practice are an identical name, and one name that is a
+    prefix of a longer one -- a married or double surname added later.
+
+    This reports rather than merges. Fusing on a name alone would silently
+    combine homonyms, and the real repair is to merge the cards in Contacts,
+    which fixes every future run and everything else that reads the address
+    book. `--fuse-by-name` is available for when you would rather not.
+    """
+    by_name: Dict[str, List[Person]] = defaultdict(list)
+    for p in people:
+        folded = fold_name(p.best_display)
+        if folded:
+            by_name[folded].append(p)
+
+    groups: List[List[Person]] = [g for g in by_name.values() if len(g) > 1]
+    claimed = {id(p) for g in groups for p in g}
+
+    # "Bruna Goveia" and "Bruna Goveia da Rocha": one name extending another at
+    # a word boundary, which an exact match cannot see.
+    names = sorted(by_name)
+    for i, short in enumerate(names):
+        if len(short.split()) < 2:
+            continue
+        for long in names[i + 1:]:
+            if not long.startswith(short + " "):
+                break
+            merged = [p for p in by_name[short] + by_name[long] if id(p) not in claimed]
+            if len(merged) > 1:
+                groups.append(merged)
+                claimed.update(id(p) for p in merged)
+    return groups
+
+
+def fuse_by_name(people: Sequence[Person]) -> List[Person]:
+    """Merge the groups `likely_duplicates` finds. Opt-in: see its docstring."""
+    groups = likely_duplicates(people)
+    absorbed = {id(p) for g in groups for p in g[1:]}
+    merged: List[Person] = []
+    for group in groups:
+        head = group[0]
+        for other in group[1:]:
+            head.keys |= other.keys
+            head.channels |= other.channels
+            head.days |= other.days
+            for name, n in other.displays.items():
+                head.displays[name] += n
+            head.out_score += other.out_score
+            head.in_score += other.in_score
+            head.n_out += other.n_out
+            head.n_in += other.n_in
+            head.n_meet += other.n_meet
+            head.n_call += other.n_call
+            head.first_ts = min(head.first_ts, other.first_ts)
+            head.last_ts = max(head.last_ts, other.last_ts)
+            head.card = head.card or other.card
+        merged.append(head)
+    heads = {id(p) for p in merged}
+    kept = [p for p in people if id(p) not in absorbed and id(p) not in heads]
+    return sorted(kept + merged, key=lambda x: (-x.score, x.best_display))
 
 
 # --------------------------------------------------------------------------
@@ -1130,8 +1248,26 @@ def cmd_rank(args: argparse.Namespace) -> int:
     people = aggregate(events, cards, now,
                        half_life_days=args.half_life,
                        drop_role_addresses=not args.keep_role_addresses)
-    people = filter_people(people, args.min_active_days)
+    people = filter_people(people, args.min_active_days,
+                           drop_broadcasters=not args.keep_broadcasters)
+    if args.fuse_by_name:
+        people = fuse_by_name(people)
     rows = [person_row(i + 1, p) for i, p in enumerate(people)]
+
+    if args.duplicates:
+        groups = likely_duplicates(people)
+        if not groups:
+            print("No likely duplicates.")
+            return 0
+        print("%d likely duplicate(s). Merging the cards in Contacts fixes these"
+              % len(groups))
+        print("at the source, for this tool and everything else.\n")
+        for group in sorted(groups, key=lambda g: -sum(p.score for p in g)):
+            print("  %s" % group[0].best_display)
+            for p in group:
+                print("      %-8.1f %s" % (p.score, ", ".join(
+                    display_key(k) for k in sorted(p.keys))))
+        return 0
 
     if not args.quiet:
         for line in notes:
@@ -1242,7 +1378,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
     role = {e.key for e in events if is_role_address(e.key)}
     unfiltered = aggregate(events, cards, now, half_life_days=args.half_life,
                            drop_role_addresses=not args.keep_role_addresses)
-    people = filter_people(unfiltered, args.min_active_days)
+    people = filter_people(unfiltered, args.min_active_days,
+                           drop_broadcasters=not args.keep_broadcasters)
 
     say("ranking (window %dd, half-life %.0fd, min-active-days %d)"
         % (args.since, args.half_life, args.min_active_days))
@@ -1276,6 +1413,12 @@ def cmd_stats(args: argparse.Namespace) -> int:
     say("  %-24s %6d   -- of the top 50: %d"
         % ("NOT in address book", sum(1 for p in people if not p.card),
            sum(1 for p in top if not p.card)))
+    say()
+
+    dupes = likely_duplicates(people)
+    if dupes:
+        say("  %-24s %6d groups, %d people   <- `rank --duplicates`"
+            % ("likely duplicates", len(dupes), sum(len(g) for g in dupes)))
     say()
 
     say("identities")
@@ -1347,6 +1490,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "macOS releases; treat the result as corroborating only.")
     r.add_argument("--keep-role-addresses", action="store_true",
                    help="do not filter no-reply/notifications/billing senders")
+    r.add_argument("--keep-broadcasters", action="store_true",
+                   help="do not filter senders you never write back to")
+    r.add_argument("--duplicates", action="store_true",
+                   help="list people who appear twice under different addresses")
+    r.add_argument("--fuse-by-name", action="store_true",
+                   help="merge those duplicates instead of reporting them")
     r.add_argument("--out", metavar="FILE.csv", help="write the full ranking as CSV")
     r.add_argument("--json", metavar="FILE.json", help="write the full ranking as JSON")
     r.add_argument("--quiet", action="store_true", help="suppress the per-source summary")
@@ -1362,6 +1511,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--sources", metavar="LIST")
     d.add_argument("--include-coreduet", action="store_true")
     d.add_argument("--keep-role-addresses", action="store_true")
+    d.add_argument("--keep-broadcasters", action="store_true")
     d.set_defaults(func=cmd_stats)
     return ap
 

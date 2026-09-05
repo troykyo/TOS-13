@@ -92,11 +92,27 @@ public enum RoleAddress {
             + "salesforce\\.com|hubspot\\.com|intercom-mail\\.com|zendesk\\.com)$",
         options: [.caseInsensitive])
 
+    /// An unambiguous machine token anywhere in the local part, bounded by a
+    /// delimiter. `localPart` above only matches a local part that *is* a role
+    /// name; real bulk senders prefix it — `scholaralerts-noreply`,
+    /// `jobalerts-noreply`. Deliberately narrower than `localPart`, because this
+    /// one can match inside a name and must not: "alerts", "newsletter" and
+    /// "digest" were here and were removed, since they can sit inside a name and
+    /// the structural broadcaster rule catches those senders anyway. Where a
+    /// lexical rule and a structural one overlap, keep the structural one.
+    private static let tokenAnywhere = try! NSRegularExpression(
+        pattern: "(^|[._+-])(no-?reply|do-?not-?reply|donotreply|noreply|"
+            + "mailer-daemon|postmaster|bounces?|notifications?)([._+-]|$)",
+        options: [.caseInsensitive])
+
     public static func matches(_ identity: Identity) -> Bool {
         guard identity.kind == .email else { return false }
         let parts = identity.value.split(separator: "@", maxSplits: 1)
         guard parts.count == 2 else { return false }
-        return matches(localPart, String(parts[0])) || matches(domain, String(parts[1]))
+        let local = String(parts[0])
+        return matches(localPart, local)
+            || matches(tokenAnywhere, local)
+            || matches(domain, String(parts[1]))
     }
 
     private static func matches(_ regex: NSRegularExpression, _ s: String) -> Bool {
