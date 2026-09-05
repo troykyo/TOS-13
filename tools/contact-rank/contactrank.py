@@ -25,6 +25,7 @@ is not, and why.
 
 Usage:
     python3 contactrank.py probe
+    python3 contactrank.py stats
     python3 contactrank.py rank --top 50
     python3 contactrank.py rank --out ranking.csv --json ranking.json
     python3 contactrank.py rank --since 730 --half-life 120 --me you@example.com
@@ -41,6 +42,7 @@ import csv
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -1035,10 +1037,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_rank(args: argparse.Namespace) -> int:
-    now = datetime.now(timezone.utc).timestamp()
+def gather(args: argparse.Namespace, now: float) -> Tuple[List[Event], List[Card], List[str]]:
+    """Read every enabled source. Shared by `rank` and `stats`."""
     since_ts = now - args.since * 86400.0
-    own = {k for k in (norm_email(a) for a in (args.me or [])) if k}
+    own = {k for k in (norm_email(a) for a in (getattr(args, "me", None) or [])) if k}
 
     wanted = set(args.sources.split(",")) if args.sources else {
         "mail", "imessage", "call", "calendar"}
@@ -1074,6 +1076,12 @@ def cmd_rank(args: argparse.Namespace) -> int:
 
     cards = extract_cards(find_addressbook_dbs())
     notes.append("%-9s %7d cards" % ("contacts", len(cards)))
+    return events, cards, notes
+
+
+def cmd_rank(args: argparse.Namespace) -> int:
+    now = datetime.now(timezone.utc).timestamp()
+    events, cards, notes = gather(args, now)
 
     people = aggregate(events, cards, now,
                        half_life_days=args.half_life,
@@ -1104,6 +1112,151 @@ def cmd_rank(args: argparse.Namespace) -> int:
             print("No interactions found. Run `probe` to see which stores are readable.")
             return 1
         print_table(rows, args.top)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Diagnostics
+# --------------------------------------------------------------------------
+
+def redact_path(path: object) -> str:
+    """Replace the home directory with ~, so paths carry no account name."""
+    return str(path).replace(str(HOME), "~")
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    """Nearest-rank percentile. No dependencies, and exact enough for a report."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    k = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
+    return ordered[k]
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """
+    A diagnostic report containing no personal data.
+
+    The report you want to share when asking whether a run looks right. It
+    carries counts, distributions, schema fingerprints and errors, and no names,
+    addresses, phone numbers, organisations or domains -- so sending it somewhere
+    does not disclose your contacts, who are third parties who never agreed to
+    that. `rank --out` is the one that writes personal data, and it says so.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    out = []
+
+    def say(line: str = "") -> None:
+        out.append(line)
+
+    say("contactrank stats -- diagnostic report, contains no personal data")
+    say()
+    say("environment")
+    mac = platform.mac_ver()[0]
+    say("  platform          %s" % (("macOS " + mac) if mac else platform.system()))
+    say("  python            %s" % platform.python_version())
+    say("  sqlite            %s" % sqlite3.sqlite_version)
+    say()
+
+    say("stores")
+    for name, finder in SOURCES.items():
+        paths = finder()
+        if not paths:
+            say("  %-10s not present" % name)
+            continue
+        for path in paths:
+            try:
+                with ReadOnlyDB(path) as conn:
+                    tables = sorted(
+                        r[0] for r in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"))
+                    counts = ["%s=%s" % (t, count_rows(conn, t)) for t in tables
+                              if count_rows(conn, t)]
+                    say("  %-10s %s" % (name, redact_path(path)))
+                    say("  %-10s %d tables; %s" % ("", len(tables),
+                                                   " ".join(counts[:8]) or "empty"))
+            except SourceError as exc:
+                say("  %-10s %s" % (name, redact_path(exc)))
+    say()
+
+    events, cards, notes = gather(args, now)
+    say("sources")
+    for line in notes:
+        say("  " + line)
+    say()
+
+    role = {e.key for e in events if is_role_address(e.key)}
+    unfiltered = aggregate(events, cards, now, half_life_days=args.half_life,
+                           drop_role_addresses=not args.keep_role_addresses)
+    people = filter_people(unfiltered, args.min_active_days)
+
+    say("ranking (window %dd, half-life %.0fd, min-active-days %d)"
+        % (args.since, args.half_life, args.min_active_days))
+    say("  people ranked            %6d" % len(people))
+    say("  dropped as one-shot      %6d" % (len(unfiltered) - len(people)))
+    say("  role senders suppressed  %6d distinct addresses" % len(role))
+    say()
+
+    if not people:
+        say("No one ranked. If the stores above show rows but the sources show few")
+        say("events, the window may be too narrow, or a schema may have moved.")
+        print("\n".join(out))
+        return 1
+
+    scores = [p.score for p in people]
+    say("score distribution")
+    for label, q in (("max", 1.0), ("p90", 0.9), ("median", 0.5), ("p10", 0.1), ("min", 0.0)):
+        say("  %-8s %10.1f" % (label, percentile(scores, q)))
+    say()
+
+    total = len(people)
+
+    def share(label: str, n: int) -> None:
+        say("  %-24s %6d / %d  (%3.0f%%)" % (label, n, total, 100.0 * n / total))
+
+    top = people[:50]
+    say("coverage")
+    share("in address book", sum(1 for p in people if p.card))
+    share("has a photo", sum(1 for p in people if p.card and p.card.has_image))
+    share("has a LinkedIn URL", sum(1 for p in people if p.card and p.card.linkedin))
+    say("  %-24s %6d   -- of the top 50: %d"
+        % ("NOT in address book", sum(1 for p in people if not p.card),
+           sum(1 for p in top if not p.card)))
+    say()
+
+    say("identities")
+    say("  %-24s %6d" % ("people with >1 identity",
+                         sum(1 for p in people if len(p.keys) > 1)))
+    say("  %-24s %6d" % ("phone-only",
+                         sum(1 for p in people
+                             if all(k.startswith("tel:") for k in p.keys))))
+    say("  %-24s %6d" % ("email-only",
+                         sum(1 for p in people
+                             if all(k.startswith("mailto:") for k in p.keys))))
+    say()
+
+    say("channels (people reached by each)")
+    for channel in ("mail", "imessage", "call", "calendar", "coreduet"):
+        n = sum(1 for p in people if channel in p.channels)
+        if n:
+            say("  %-24s %6d" % (channel, n))
+    say()
+
+    say("reciprocity")
+    bands = [("balanced  >=0.75", 0.75, 1.01), ("two-way   0.45-0.75", 0.45, 0.75),
+             ("lopsided  0.15-0.45", 0.15, 0.45), ("one-sided  <0.15", -0.01, 0.15)]
+    for label, low, high in bands:
+        say("  %-24s %6d" % (label, sum(1 for p in people
+                                        if low <= p.reciprocity < high)))
+    say()
+
+    say("activity")
+    days = [len(p.days) for p in people]
+    say("  %-24s %6d" % ("median days in contact", int(percentile(days, 0.5))))
+    say("  %-24s %6d" % ("people with a meeting", sum(1 for p in people if p.n_meet)))
+    say("  %-24s %6d" % ("people with a call", sum(1 for p in people if p.n_call)))
+
+    print("\n".join(out))
     return 0
 
 
@@ -1144,6 +1297,18 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--json", metavar="FILE.json", help="write the full ranking as JSON")
     r.add_argument("--quiet", action="store_true", help="suppress the per-source summary")
     r.set_defaults(func=cmd_rank)
+
+    d = sub.add_parser(
+        "stats",
+        help="diagnostic report with no personal data in it -- safe to share")
+    d.add_argument("--since", type=int, default=DEFAULT_WINDOW_DAYS, metavar="DAYS")
+    d.add_argument("--half-life", type=float, default=DEFAULT_HALF_LIFE_DAYS,
+                   metavar="DAYS")
+    d.add_argument("--min-active-days", type=int, default=3, metavar="N")
+    d.add_argument("--sources", metavar="LIST")
+    d.add_argument("--include-coreduet", action="store_true")
+    d.add_argument("--keep-role-addresses", action="store_true")
+    d.set_defaults(func=cmd_stats)
     return ap
 
 

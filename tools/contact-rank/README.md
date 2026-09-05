@@ -20,6 +20,7 @@ The model is set out in proposal §2.3.
 
 ```sh
 python3 contactrank.py probe                       # what is readable, and what is not
+python3 contactrank.py stats                       # diagnostic report, safe to share
 python3 contactrank.py rank --top 50               # print the ranking
 python3 contactrank.py rank --out ranking.csv      # full ranking to CSV
 python3 contactrank.py rank --since 365            # present tense only
@@ -29,6 +30,14 @@ python3 contactrank.py rank --sources calendar     # meetings alone
 
 Start with `probe`. It reports which of the six stores exist, how many rows each
 holds, and what is blocking access.
+
+Then `stats`, which describes the shape of a run — per-source event counts,
+score distribution, how many of your contacts already have a photo or a LinkedIn
+URL, how many of your top fifty are not in the address book at all — **with no
+names, addresses, phone numbers, organisations or domains in it**. That is the
+report to paste into a chat or an issue when asking whether a run looks right.
+Your contacts are third parties who did not agree to being disclosed, and
+`rank --out` is the command that writes them; it says so when it does.
 
 ## Full Disk Access
 

@@ -186,6 +186,40 @@ class TestCLIAgainstASyntheticHome(unittest.TestCase):
         self.assertEqual(rows[0]["rank"], 1)
         self.assertEqual(rows[0]["name"], "Anna Rossi")
 
+    def test_stats_reports_the_shape_of_the_run(self):
+        rc, out, _ = self._run(["stats"])
+        self.assertEqual(rc, 0)
+        for heading in ("environment", "stores", "sources", "ranking",
+                        "score distribution", "coverage", "identities",
+                        "channels", "reciprocity", "activity"):
+            self.assertIn(heading, out)
+        self.assertIn("people ranked", out)
+        self.assertIn("NOT in address book", out)
+        self.assertIn("Envelope Index", out)
+
+    def test_stats_discloses_no_personal_data(self):
+        """
+        The whole point of this subcommand: a report you can paste into a chat,
+        an issue or an email without disclosing your contacts, who are third
+        parties and did not agree to that. If this test fails, the report has
+        started leaking and must not be shared.
+        """
+        rc, out, _ = self._run(["stats"])
+        self.assertEqual(rc, 0)
+        forbidden = [
+            "Anna", "Rossi", "Marco", "Bianchi", "Lanificio", "Filatura",
+            "Textile News", "Direttrice", "Titolare",
+            "anna@lanificio.it", "marco@filatura.it", "me@studio.it",
+            "newsletter@textilenews.com", "lanificio.it", "filatura.it",
+            "studio.it", "textilenews.com", "linkedin.com/in/anna-rossi",
+            "390557654321", "557654321", "UID-1", "UID-2",
+        ]
+        for needle in forbidden:
+            self.assertNotIn(needle, out, "stats disclosed %r" % needle)
+        # Nor the account name embedded in every real store path.
+        self.assertNotIn(str(self.home), out)
+        self.assertIn("~/Library", out)
+
     def test_empty_window_reports_nothing_found(self):
         rc, out, _ = self._run(["rank", "--since", "0"])
         self.assertEqual(rc, 1)
