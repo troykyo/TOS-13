@@ -7,3 +7,9 @@ ranking.csv
 ranking.json
 *.ranking.csv
 *.ranking.json
+
+# SwiftPM
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/

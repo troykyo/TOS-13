@@ -881,7 +881,10 @@ def aggregate(
                 p.card = key_to_card[k]
                 break
 
-    return sorted(people.values(), key=lambda x: x.score, reverse=True)
+    # Descending score, ties broken on the display name so that the output is
+    # deterministic and diffable against the Swift implementation, which cannot
+    # rely on a stable sort.
+    return sorted(people.values(), key=lambda x: (-x.score, x.best_display))
 
 
 def filter_people(people: Sequence[Person], min_active_days: int) -> List[Person]:
@@ -916,7 +919,7 @@ def person_row(rank: int, p: Person) -> Dict[str, object]:
         "title": card.title if card else "",
         "score": round(p.score, 3),
         "volume": round(p.volume, 3),
-        "reciprocity": round(p.reciprocity, 3),
+        "reciprocity": round(p.reciprocity, 3),  # numeric here; CSV formats via csv_cell
         "sent": p.n_out,
         "received": p.n_in,
         "meetings": p.n_meet,
@@ -931,6 +934,19 @@ def person_row(rank: int, p: Person) -> Dict[str, object]:
         "has_photo": bool(card.has_image) if card else False,
         "linkedin_url": card.linkedin if card else "",
     }
+
+
+def csv_cell(value: object) -> str:
+    """
+    Render one value for CSV. Booleans as lowercase and floats at fixed
+    precision, so that this file and the Swift app's export are byte-identical
+    for the same input and can be diffed against each other on one machine.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return "%.3f" % value
+    return str(value)
 
 
 COLUMNS = [
@@ -1072,10 +1088,10 @@ def cmd_rank(args: argparse.Namespace) -> int:
 
     if args.out:
         with open(args.out, "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=COLUMNS)
-            w.writeheader()
+            w = csv.writer(fh)
+            w.writerow(COLUMNS)
             for r in rows:
-                w.writerow(r)
+                w.writerow([csv_cell(r[c]) for c in COLUMNS])
         print("wrote %s (%d rows) -- contains personal data, handle accordingly"
               % (args.out, len(rows)), file=sys.stderr)
     if args.json:

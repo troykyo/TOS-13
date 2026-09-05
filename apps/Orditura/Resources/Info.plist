@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Orditura</string>
+    <key>CFBundleIdentifier</key>
+    <string>it.tos13.orditura</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Orditura</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>TOS-13</string>
+    <!-- Reading the address book through Contacts.framework, which is the right
+         route for writing anything back in a later stage. -->
+    <key>NSContactsUsageDescription</key>
+    <string>Orditura reads your address book to attach names, organisations and existing profile links to the contacts it ranks. Nothing is uploaded.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Orditura reads meeting attendees to work out who you actually meet. Nothing is uploaded.</string>
+</dict>
+</plist>

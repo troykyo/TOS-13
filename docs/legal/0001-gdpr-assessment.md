@@ -23,7 +23,7 @@ else is drafted.
 |---|---|---|---|---|
 | **A** Contact graph | Identify the professional contacts who matter most, to prioritise relationship management | Names, email addresses, phone numbers, communication metadata (timestamps, direction, audience size). **No message content.** | The controller's own Mac | Art. 6(1)(f) |
 | **B** Profile resolution | Associate a known contact with their public professional profile | Name, organisation, public profile URL | Address book, LinkedIn data export, own correspondence signatures, optionally a search API | Art. 6(1)(f) |
-| **C** Photograph | Recognise contacts in a professional address book | One profile photograph, provenance, retrieval timestamp | Existing contact card, Gravatar, employer website, or LinkedIn with human confirmation | Art. 6(1)(f) |
+| **C** Photograph | Recognise contacts in a professional address book | One profile photograph, provenance, retrieval timestamp, match confidence | Existing contact card, Gravatar, employer website, or LinkedIn (posture C3, rate-limited unattended — proposal §4.5) | Art. 6(1)(f) |
 
 **Data subjects.** Business contacts of the controller with whom a prior,
 evidenced interaction exists in the controller's own records. No speculative
@@ -70,12 +70,21 @@ retained.
 | Scale | Bounded: hundreds of known contacts, not an open harvest. |
 | Intrusiveness | Low. Local storage, single-user access, no profiling of the subject's behaviour, no automated decision-making about them, no disclosure. |
 | Countervailing risk | The graph reveals the *controller's own* social pattern more than any subject's. It never leaves the machine. |
+| Accuracy | Art. 5(1)(d) is served by a confidence threshold rather than by per-item human confirmation: a match below it is queued for review and never written unattended, every record carries the basis and confidence of its match, and every record is reversible. This substitution is what the C3 decision (proposal §4.5) turns on — if the threshold is removed or set so low that it never triggers, the accuracy safeguard is gone and this assessment must be redone. |
 | Safeguards | Sections 4–6 below. |
 
 **Conclusion:** the interest is not overridden, **conditional on** the six design
 rules in proposal §5.7 being maintained. Removing rule 1 (no face processing) or
 rule 2 (evidenced prior interaction only) invalidates this assessment and it
-must be redone.
+must be redone. Note that rules 1, 2 and 4 do all the balancing work here; rule
+3 was revised when posture C3 was chosen, and the confidence threshold now
+carries the accuracy obligation in its place.
+
+Separately from data protection: C3 is an acknowledged breach of LinkedIn's
+User Agreement §8.2 (proposal §5.5). That is a contractual exposure of the
+controller's own, not a data-protection one, and it does not bear on the
+Article 6(1)(f) analysis — but it is a decision the controller has taken with
+its consequences recorded, not an oversight.
 
 ## 4. Transparency (Art. 14)
 

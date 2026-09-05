@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft for review — Stage A implemented, Stages B and C awaiting a decision |
+| **Status** | Stage A implemented (CLI + Mac app). Stage C posture decided: **C3**. Stage B pending |
 | **Date** | 2026-09-05 |
 | **Scope** | TOS-13 tool family, first tool |
 | **Decision owners** | Design engineering + whoever acts as controller for the studio's contact data |
@@ -24,7 +24,7 @@ legal exposure:
 
 | Stage | Question | Difficulty | Risk | Status |
 |---|---|---|---|---|
-| **A** | Who actually matters to me? | Moderate — undocumented schemas | **None** — local, read-only | **Implemented** (`tools/contact-rank`) |
+| **A** | Who actually matters to me? | Moderate — undocumented schemas | **None** — local, read-only | **Implemented** (`tools/contact-rank`, `apps/Orditura`) |
 | **B** | Which LinkedIn profile is this person? | Hard — entity resolution | Low to moderate | Designed, not built |
 | **C** | How do I obtain their photograph? | Easy technically | **High** — contract, GDPR, copyright | Designed, decision required |
 
@@ -219,15 +219,15 @@ which changes the risk calculus considerably.
 | | Posture | Mechanism | ToS exposure | GDPR posture | Verdict |
 |---|---|---|---|---|---|
 | C1 | **Manual** | App opens the profile in the default browser; user saves the photo | None | Clean | Works, doesn't scale |
-| C2 | **Assisted** ✅ | Embedded `WKWebView` on the user's own session; app navigates to one profile and **stops**; user confirms identity and clicks Save | Minimal — a bookmark queue with a save button | Clean, with a human accuracy check | **Recommended** |
-| C3 | **Rate-limited unattended** | Same, but the app advances and saves by itself | Real: §8.2 breach, account restriction | Defensible only with a documented LIA | Off by default, behind an explicit acknowledgement |
+| C2 | **Assisted** | Embedded `WKWebView` on the user's own session; app navigates to one profile and **stops**; user confirms identity and clicks Save | Minimal — a bookmark queue with a save button | Clean, with a human accuracy check | Recommended; not chosen |
+| C3 | **Rate-limited unattended** ✅ | Same, but the app advances and saves by itself | Real: §8.2 breach, account restriction | Defensible with a documented LIA and the §4.4 budgets | **Chosen** — see §4.5 |
 | C4 | **Evasive** | UA spoofing, proxy rotation, CAPTCHA solving | Severe; changes the legal character of the act | Indefensible | **Out of scope. Will not be built.** |
 
-C2 deserves the emphasis. It satisfies the original request almost exactly —
-you go through individual profiles, at human pace, through the web interface —
-while remaining, in substance, a person browsing with a well-organised queue.
-It is also *better data*, because the human catches the wrong-Marco-Bianchi
-case that no matcher will.
+C2 was the recommendation: it satisfies the original request almost exactly —
+individual profiles, at human pace, through the web interface — while
+remaining, in substance, a person browsing with a well-organised queue, and it
+is *better data*, because a human catches the wrong-Marco-Bianchi case that no
+matcher will.
 
 ### 4.3 Engineering notes for the embedded browser
 
@@ -245,10 +245,11 @@ case that no matcher will.
   restrict it to connections. If it is not visible to you as an ordinary viewer,
   that is a visibility preference — treat it as a decision, not an obstacle.
 
-### 4.4 Politeness engineering, if C3 is ever enabled
+### 4.4 Politeness engineering (binding under C3)
 
 These are the parameters that make an unattended run defensible as "slow"
-rather than merely slower:
+rather than merely slower. Under the decision in §4.5 they are hard-coded, not
+settings:
 
 - **Concurrency 1.** Never parallel, including image fetches.
 - **Poisson-jittered intervals** around a 90 s mean, never a fixed cadence — a
@@ -264,6 +265,28 @@ rather than merely slower:
 - **Exponential backoff with full jitter** on any non-200; honour `Retry-After`.
 - **Persistent, resumable queue** with per-profile state, so stopping is always
   safe and never loses work.
+
+### 4.5 Decision: C3, with C2's safeguards kept where they are cheap
+
+**C3 was chosen** by the decision owner, with the §4.4 budgets and circuit
+breaker binding rather than configurable. Recording what that costs, so the
+choice stays visible rather than implicit:
+
+- **The exposure is authentication, not rate.** Slowing down does not reduce the
+  contractual position; being logged in is what makes it §8.2 automated access.
+  The practical remedy LinkedIn reaches for is account restriction, and the
+  account is the user's own professional presence. §4.4 reduces the chance of
+  being noticed; it does not change what is being done.
+- **C4 remains out of scope and will not be built.** User-agent spoofing, proxy
+  rotation and CAPTCHA solving are not "more of C3" — they are the step from
+  rate-limited automation to evading a control, and design rule 4 is not
+  relaxed by this decision.
+- **Accuracy needs a different mechanism now.** Without a human on every save,
+  Article 5(1)(d) is served by a confidence threshold instead: below it, a match
+  is queued for review rather than written. See the revised rule 3 in §5.7.
+- **C2 remains the first run.** The queue should be worked attended once before
+  it is left alone, so the confidence threshold is calibrated against real
+  matches rather than guessed.
 
 ---
 
@@ -343,8 +366,9 @@ Four distinct issues, often collapsed into one:
   contract**, and *Meta v. Bright Data* (N.D. Cal. 2024) turned on whether the
   scraper was **logged in**. The distinction is directly load-bearing here,
   because this design is logged in by construction. That is precisely where the
-  contract bites hardest, and it is the strongest argument for posture C2 over
-  C3 — a human clicking Save is not "automated access" in the relevant sense.
+  contract bites hardest, and it is the exposure that the C3 decision (§4.5)
+  accepts: a human clicking Save would not be "automated access" in the relevant
+  sense, and an unattended run is.
 - **Copyright.** A portrait is a protected work under Directive 2001/29/EC and
   the rights usually sit with the subject or their photographer, not with
   LinkedIn. The Article 5(2)(b) private-copying exception requires a natural
@@ -357,7 +381,9 @@ Four distinct issues, often collapsed into one:
 - **robots.txt.** LinkedIn disallows crawling of `/in/` for general agents.
   Ignoring it is not itself unlawful in the EU, but it is evidence of
   unauthorised access, and in some member states circumventing an access control
-  raises separate questions (in Germany, §202a StGB). Another point for C2.
+  raises separate questions (in Germany, §202a StGB). Circumventing an access
+  control is a different matter from ignoring robots.txt, which is why rule 4
+  holds regardless of posture.
 
 ### 5.6 Accountability
 
@@ -377,7 +403,10 @@ These are constraints on the implementation, not aspirations:
    out of scope.
 2. **Enrich only people with an evidenced prior interaction** in the local
    stores. No speculative lookups, no expanding to second-degree contacts.
-3. **A human confirms every identity match and every save, by default.**
+3. **Every match records its basis and confidence.** Matches below the
+   confidence threshold are queued for human review and never written
+   unattended; every saved record is reversible in one click. (Revised from
+   "a human confirms every save" when C3 was chosen — §4.5.)
 4. **Never evade a technical control.** No user-agent spoofing, no proxy
    rotation, no CAPTCHA solving. A challenge stops the run.
 5. **Every stored record carries provenance, a retrieval timestamp, a retention
@@ -440,12 +469,11 @@ does the fetching). Offered, not imposed.
    resolves most of the queue; entirely sanctioned.
 3. **Exhaust the non-LinkedIn photo sources** — existing contact photos,
    Gravatar, company sites. Measure what is left. The residue is usually small.
-4. **Build Stage C as posture C2**, human-confirmed. It matches the original
-   description of the desired behaviour almost exactly and is defensible without
-   argument.
-5. **Treat C3 as a switch, not a default** — off, behind an explicit
-   acknowledgement, with the section 4.4 budgets hard-coded rather than
-   configurable.
+4. **Stage C is C3**, per §4.5, with the §4.4 budgets and circuit breaker
+   hard-coded rather than configurable, and the confidence threshold doing the
+   accuracy work that a human would otherwise do.
+5. **Work the first queue attended anyway**, to calibrate that threshold against
+   real matches before anything runs unsupervised.
 6. **Write the LIA and the privacy notice before the first fetch**, not after.
    Both are short. `docs/legal/0001-gdpr-assessment.md` has the drafts.
 
@@ -453,8 +481,8 @@ does the fetching). Offered, not imposed.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| 1 | LinkedIn restricts or bans the user's account | Medium under C3, low under C2 | High — personal professional cost | C2 default; budgets; circuit breaker |
-| 2 | Wrong person's photograph stored | High without review | Medium — corrupts the address book | Human confirmation; `match_confidence`; reversible |
+| 1 | LinkedIn restricts or bans the user's account | **Medium — C3 accepted by the decision owner (§4.5)** | High — personal professional cost | §4.4 budgets; circuit breaker; no evasion (rule 4) |
+| 2 | Wrong person's photograph stored | Medium under C3 | Medium — corrupts the address book | Confidence threshold; review queue below it; `match_confidence` recorded; reversible |
 | 3 | macOS schema change breaks an extractor | High over a few releases | Low | Schema introspection; per-source degradation; `probe` |
 | 4 | Full Disk Access refused or revoked | Medium | Medium — no ranking | Explicit onboarding; partial results from Contacts alone |
 | 5 | Art. 14 notice never issued | Medium | Medium — regulatory | Notice URL in signature before first fetch |

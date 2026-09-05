@@ -151,17 +151,20 @@ class TestCLIAgainstASyntheticHome(unittest.TestCase):
         with dest.open(encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(list(rows[0].keys()), cr.COLUMNS)
+        # Fixed-precision floats and lowercase booleans, matching the Swift export.
+        self.assertRegex(rows[0]["score"], r"^\d+\.\d{3}$")
+        self.assertIn(rows[0]["in_contacts"], ("true", "false"))
         anna = next(r for r in rows if r["name"] == "Anna Rossi")
         self.assertEqual(anna["organisation"], "Lanificio Rossi")
         self.assertEqual(anna["linkedin_url"], "https://www.linkedin.com/in/anna-rossi")
-        self.assertEqual(anna["has_photo"], "True")
+        self.assertEqual(anna["has_photo"], "true")
         self.assertIn("calendar", anna["channels"])
         self.assertIn("mail", anna["channels"])
 
         marco = next(r for r in rows if r["name"] == "Marco Bianchi")
         # Marco is reachable only by phone; the address book fuses the iMessage
         # handle and the call record onto his card, and he still needs a photo.
-        self.assertEqual(marco["has_photo"], "False")
+        self.assertEqual(marco["has_photo"], "false")
         self.assertEqual(marco["linkedin_url"], "")
         self.assertIn("imessage", marco["channels"])
         self.assertIn("call", marco["channels"])
