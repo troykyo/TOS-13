@@ -4,8 +4,8 @@
 #
 # Calm: the LEDs slowly fade up and down -- green, then orange, then
 # green, then orange.
-# Any small vibration: the LEDs flash orange and green, and keep flashing
-# until the board has been still for FLASH_HOLD seconds.
+# A vibration well above the 60-second rolling average: the LEDs flash
+# orange and green for 3 seconds.
 
 import math
 import time
@@ -14,8 +14,9 @@ from adafruit_circuitplayground import cp
 
 BRIGHTNESS = 0.3     # LED brightness (0..1)
 PULSE_TIME = 3.0     # seconds for one slow fade up and down
-SENSITIVITY = 0.4    # vibration that triggers flashing (m/s^2); lower = more sensitive
-FLASH_HOLD = 2.0     # seconds of flashing after the last vibration
+SENSITIVITY = 4.0    # flash when a vibration is 4x the rolling average; lower = more sensitive
+AVERAGE_TIME = 60    # seconds in the rolling average; older readings are flushed
+FLASH_TIME = 3.0     # seconds of flashing per detected vibration
 FLASH_SPEED = 0.17   # seconds per colour: 3 flashes per second, the photosensitivity limit
 
 GREEN = (40, 255, 0)
@@ -32,19 +33,36 @@ def show(color, level):
 
 time.sleep(1)                        # let the board settle after power-up
 base = list(cp.acceleration)
-last_vibration = -100.0
+sums = [0.0] * AVERAGE_TIME          # vibration readings added up per second ...
+counts = [0] * AVERAGE_TIME          # ... and how many readings that second
+second = int(time.monotonic()) % AVERAGE_TIME
+average = 100.0                      # no flashing until the first second is measured
+flash_until = 0.0
 
 while True:
     now = time.monotonic()
     x, y, z = cp.acceleration
-    if abs(x - base[0]) + abs(y - base[1]) + abs(z - base[2]) > SENSITIVITY:
-        last_vibration = now
+    vibration = abs(x - base[0]) + abs(y - base[1]) + abs(z - base[2])
     # the baseline slowly follows gravity and tilt, not quick vibrations
     base[0] += (x - base[0]) * 0.05
     base[1] += (y - base[1]) * 0.05
     base[2] += (z - base[2]) * 0.05
 
-    if now - last_vibration < FLASH_HOLD:
+    # rolling average: each new second flushes the second from AVERAGE_TIME ago
+    s = int(now) % AVERAGE_TIME
+    if s != second:
+        second = s
+        sums[s] = 0.0
+        counts[s] = 0
+        average = sum(sums) / max(1, sum(counts))
+    sums[s] += vibration
+    counts[s] += 1
+
+    # max(..., 0.04): never react to a single accelerometer step (~0.04 m/s^2)
+    if now >= flash_until and vibration > SENSITIVITY * max(average, 0.04):
+        flash_until = now + FLASH_TIME
+
+    if now < flash_until:
         # flashy: orange and green alternate at full brightness
         show(ORANGE if int(now / FLASH_SPEED) % 2 else GREEN, 1)
     else:
