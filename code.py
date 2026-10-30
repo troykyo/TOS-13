@@ -1,31 +1,34 @@
 # Haunted Pumpkin Guard -- Halloween table game for the
-# Adafruit Circuit Playground Express (CircuitPython 8/9).
+# Adafruit Circuit Playground Express (CircuitPython 8 or 9).
 #
 # Lay the board on the candy table. It glows like a lit pumpkin.
-# Anyone who bumps or knocks the table (or casts a shadow over the board)
-# wakes it up: orange/green light show + spooky sounds.
+# When someone bumps or knocks the table, the accelerometer wakes it up:
+# a slow glow turns flashy, then scratchy ... then BOO.
 #
 # Controls
 #   Slide switch  left = sound on, right = silent (lights only)
-#   Button A      cycle vibration sensitivity (1..4 green pixels)
+#   Button A      cycle knock sensitivity (1..4 green pixels)
 #   Button B      start a "Steal the Candy" round (see README)
 
+import array
 import math
 import random
 import time
 
-try:
-    from adafruit_circuitplayground import cp
-except ImportError:  # very old firmware
-    from adafruit_circuitplayground.express import cpx as cp
+import audiocore
+import audioio
+import board
+from adafruit_circuitplayground import cp
 
 # ---------------------------------------------------------------- settings
 BRIGHTNESS = 0.35        # normal ring brightness (0..1)
-SCARE_BRIGHTNESS = 0.8   # brightness for the final jump-scare
-SHADOW_TRIGGER = True    # also wake up when someone leans over the board
-SHADOW_RATIO = 0.55      # light must drop below 55 % of the ambient level
-SNEAK_TIME = 8.0         # seconds a player must survive in a round
+SCARE_BRIGHTNESS = 0.8   # brightness for the BOO
+GLOW_TIME = 4.5          # seconds of slow glow, then ...
+FLASH_TIME = 3.0         # ... seconds of flashing, then ...
+SCRATCH_TIME = 2.5       # ... seconds of scratching before the BOO (each +-20 %)
+SNEAK_TIME = 8.0         # seconds a player must survive in a candy round
 MIN_FLASH_GAP = 0.34     # full-ring flashes <= 3 per second (photosensitivity)
+DEBUG = False            # True: print knock readings for the Mu plotter
 
 # (hardware tap threshold, polled vibration threshold in m/s^2) per level;
 # the accelerometer runs in the 8 g range, so 1 tap unit ~ 0.06 g.
@@ -37,204 +40,242 @@ PALE = (255, 160, 60)
 OFF = (0, 0, 0)
 EYES = (2, 7)            # two opposite pixels act as glowing eyes
 
-# ---------------------------------------------------------------- helpers
 cp.pixels.auto_write = False
 cp.pixels.brightness = BRIGHTNESS
 
+# ---------------------------------------------------------------- sound
+# cp.start_tone() cannot change pitch while a tone is playing, so the game
+# drives the speaker itself: a looped sine wave for tones, and a loop of
+# random bytes that sounds like claws scratching.
+speaker = audioio.AudioOut(board.SPEAKER)
+amp = getattr(cp, "_speaker_enable", None)   # amplifier pin, owned by cp
+SINE = audiocore.RawSample(array.array(
+    "H", [int(32768 + 20000 * math.sin(math.pi * i / 16)) for i in range(32)]))
+_noise = bytearray(512)
+for _i in range(512):
+    _noise[_i] = 64 + random.getrandbits(7)
+NOISE = audiocore.RawSample(_noise)
+playing = 0              # Hz of the current tone, -rate for noise, 0 = silent
 
-def scale(c, k):
-    return (int(c[0] * k), int(c[1] * k), int(c[2] * k))
 
-
-def fill(c):
-    cp.pixels.fill(c)
-    cp.pixels.show()
+def _play(sample, rate, what):
+    global playing
+    if cp.switch and what != playing:
+        speaker.stop()               # a new sample rate only applies on play()
+        sample.sample_rate = rate
+        if amp:
+            amp.value = True
+        speaker.play(sample, loop=True)
+        playing = what
 
 
 def tone(freq):
-    if cp.switch:
-        cp.start_tone(int(freq))
+    _play(SINE, 32 * int(freq), int(freq))
 
 
-def quiet():
-    cp.stop_tone()
+def scratch(rate):
+    _play(NOISE, rate, -rate)
+
+
+def quiet(amp_off=False):
+    global playing
+    if playing:
+        speaker.stop()
+        playing = 0
+    if amp_off and amp:
+        amp.value = False            # as cp.stop_tone() does between sounds
 
 
 # ---------------------------------------------------------------- sensing
 level = 1
-accel_base = [0.0, 0.0, 0.0]
-light_base = 0.0
-dark_count = 0
+base = [0.0, 0.0, 0.0]
 
 
 def set_sensitivity():
-    cp.detect_taps = 1
     try:
-        # Lower threshold than the library default so a knock on the table,
-        # not only a tap on the board itself, is latched in hardware.
+        # Lower threshold than the library default (90) so a knock on the
+        # table, not only a tap on the board itself, is latched in hardware.
         cp._lis3dh.set_tap(1, SENSITIVITY[level][0],
                            time_limit=10, time_latency=20, time_window=255)
     except (AttributeError, TypeError):
-        pass
+        cp.detect_taps = 1
 
 
 def rearm(settle=1.2):
-    """Wait for the board to stop moving, then take fresh baselines."""
-    global light_base, dark_count
-    quiet()
+    """Wait for the board to stop moving, then take a fresh baseline."""
+    global base
+    quiet(amp_off=True)
     time.sleep(settle)
+    base = list(cp.acceleration)
+    cp.tapped  # reading clears a latched tap
+
+
+def knocked():
+    """True on a knock (latched by the accelerometer) or ongoing shaking."""
     x, y, z = cp.acceleration
-    accel_base[0], accel_base[1], accel_base[2] = x, y, z
-    light_base = cp.light
-    dark_count = 0
-    cp.tapped  # reading clears any latched tap
+    d = abs(x - base[0]) + abs(y - base[1]) + abs(z - base[2])
+    # a slow baseline follows gravity and tilt, but not sharp knocks
+    base[0] += (x - base[0]) * 0.05
+    base[1] += (y - base[1]) * 0.05
+    base[2] += (z - base[2]) * 0.05
+    tap = cp.tapped
+    if DEBUG:
+        print((d, SENSITIVITY[level][1], 5 if tap else 0))
+    return tap or d > SENSITIVITY[level][1]
 
 
-def vibration():
-    x, y, z = cp.acceleration
-    d = abs(x - accel_base[0]) + abs(y - accel_base[1]) + abs(z - accel_base[2])
-    # slow-moving baseline follows gravity/tilt but not sharp knocks
-    accel_base[0] += (x - accel_base[0]) * 0.05
-    accel_base[1] += (y - accel_base[1]) * 0.05
-    accel_base[2] += (z - accel_base[2]) * 0.05
-    return cp.tapped or d > SENSITIVITY[level][1]
+# ---------------------------------------------------------------- lights
+def scale(c, k):
+    k = 0.0 if k < 0 else 1.0 if k > 1 else k
+    return (int(c[0] * k), int(c[1] * k), int(c[2] * k))
 
 
-def shadow():
-    global light_base, dark_count
-    lux = cp.light
-    if light_base > 15 and lux < light_base * SHADOW_RATIO:
-        dark_count += 1          # require a sustained drop, not one noisy read
-        return dark_count >= 3
-    dark_count = 0
-    light_base += (lux - light_base) * 0.01
-    return False
+def ring(c):
+    cp.pixels.fill(c)
+    cp.pixels.show()
 
 
-# ---------------------------------------------------------------- effects
-def heartbeat(beats=6):
-    """Sickly green 'lub-dub' that speeds up; never drops to full dark."""
-    period = 1.0
-    for _ in range(beats):
-        t0 = time.monotonic()
-        for peak, freq in ((1.0, 110), (0.55, 90)):
-            tone(freq)
-            for k in range(8):
-                fill(scale(GREEN, 0.12 + peak * 0.88 * (1 - k / 8)))
-                time.sleep(0.015)
-            quiet()
-            time.sleep(0.06)
-        fill(scale(GREEN, 0.12))
-        time.sleep(max(MIN_FLASH_GAP, period - (time.monotonic() - t0)))
-        period *= 0.8
+def embers(lo, hi):
+    """Every pixel a randomly flickering orange between lo and hi."""
+    for i in range(10):
+        cp.pixels[i] = scale(ORANGE, lo + (hi - lo) * random.random())
 
 
-def comet(duration=3.0):
-    """Orange head with a green ghost tail, spinning faster and faster."""
-    pos, speed = 0.0, 5.0
-    t0 = last = time.monotonic()
-    while time.monotonic() - t0 < duration:
+def eyes(c):
+    cp.pixels[EYES[0]] = c
+    cp.pixels[EYES[1]] = c
+
+
+next_eyes = time.monotonic() + 5
+eyes_until = 0.0
+
+
+def idle_frame(t):
+    """Flickering jack-o'-lantern glow; now and then the eyes open."""
+    global next_eyes, eyes_until
+    breath = 0.25 + 0.12 * math.sin(t * 1.7)
+    embers(0.7 * breath, breath)
+    if t >= next_eyes:
+        eyes_until = t + 1.6
+        next_eyes = t + random.uniform(6, 14)
+    if t < eyes_until:
+        eyes(OFF if 0.7 < eyes_until - t < 0.82 else GREEN)
+    cp.pixels.show()
+
+
+# ---------------------------------------------------------------- the scare
+def heartbeat(b):
+    """Sound b seconds into a heartbeat: 'lub' ... 'dub' ... silence."""
+    if b < 0.07:
+        tone(150)
+    elif 0.15 <= b < 0.22:
+        tone(120)
+    else:
+        quiet()
+
+
+def slow_glow(duration):
+    """The light sinks, then swells slowly; eyes open; a heart starts beating."""
+    t0 = time.monotonic()
+    beat = t0 - 0.5                        # first beat after ~0.8 s of dark
+    while True:
         now = time.monotonic()
-        speed = min(speed * 1.04, 45.0)
-        pos += speed * (now - last)
-        last = now
-        head = int(pos) % 10
-        for i in range(10):
-            dist = (head - i) % 10
-            if dist == 0:
-                cp.pixels[i] = ORANGE
-            elif dist < 4:
-                cp.pixels[i] = scale(GREEN, (4 - dist) / 5)
-            else:
-                cp.pixels[i] = OFF
+        p = (now - t0) / duration          # 0 -> 1 across the phase
+        if p >= 1:
+            return
+        if now - beat > 1.3 - 0.5 * p:     # the heart speeds up
+            beat = now
+        heartbeat(now - beat)
+        glow = p * p + 0.15 * max(0.0, 1 - (now - beat) / 0.3)
+        embers(0.8 * glow, glow)
+        if p > 0.4:
+            eyes(scale(GREEN, (p - 0.4) / 0.6))
         cp.pixels.show()
-        tone(180 + speed * 25)
-        time.sleep(0.01)
-    quiet()
+        time.sleep(0.02)
 
 
-def lightning(strikes=3):
-    """Darkness, a pale flash, orange afterglow and rumbling thunder."""
-    for _ in range(strikes):
-        fill(OFF)
-        time.sleep(random.uniform(0.4, 1.0))
-        fill(PALE)
-        tone(random.randint(900, 1400))
-        time.sleep(0.06)
-        t0 = time.monotonic()
-        dt = 0.0
-        while dt < 0.6:
-            dt = time.monotonic() - t0
-            fill(scale(ORANGE, max(0.0, 0.5 - dt)))
-            tone(random.randint(60, 160))
+def flashy(duration):
+    """Each ever faster beat flashes the ring, orange and green in turn, with a
+    sting a tritone apart; between flashes the embers flicker harder."""
+    t0 = beat = time.monotonic()
+    n = 0
+    while True:
+        now = time.monotonic()
+        p = (now - t0) / duration
+        if p >= 1:
+            return
+        if now - beat >= max(MIN_FLASH_GAP, 0.7 - 0.4 * p):
+            beat = now
+            n += 1
+        k = 1 - (now - beat) / 0.25        # each flash fades in 0.25 s
+        if k > 0.3:
+            cp.pixels.fill(scale(GREEN if n % 2 else ORANGE, k))
+            tone(1245 if n % 2 else 880)
+        else:
+            quiet()
+            embers(0.1, 0.4)
+            eyes(GREEN)
+        cp.pixels.show()
+        time.sleep(0.02)
+
+
+def scratchy(duration):
+    """Claws: bursts of scratching noise while streaks rake the ring."""
+    end = time.monotonic() + duration
+    while time.monotonic() < end:
+        pos = random.randint(0, 9)
+        step = random.choice((1, -1))
+        scratch(random.randint(5000, 14000))
+        for _ in range(random.randint(3, 6)):
+            embers(0.05, 0.15)
+            cp.pixels[pos % 10] = PALE
+            cp.pixels[(pos - step) % 10] = GREEN
+            cp.pixels[(pos - 2 * step) % 10] = scale(GREEN, 0.3)
+            cp.pixels.show()
+            pos += step
             time.sleep(0.03)
         quiet()
-        time.sleep(MIN_FLASH_GAP)
-
-
-def possessed(duration=2.0):
-    """Pixels twitch between orange, green and dark; the board 'chatters'."""
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < duration:
-        i = random.randint(0, 9)
-        cp.pixels[i] = random.choice((ORANGE, GREEN, OFF, OFF))
+        embers(0.05, 0.15)
         cp.pixels.show()
-        tone(random.choice((233, 311, 466, 622, 932)))
-        time.sleep(random.uniform(0.03, 0.09))
-    quiet()
+        time.sleep(random.uniform(0.03, 0.25))
 
 
-def eyes_jumpscare():
-    """Green eyes slowly open in the dark, silence ... then BOO."""
-    fill(OFF)
-    steps = 40
-    for k in range(steps):
-        c = scale(GREEN, (k + 1) / steps)
-        cp.pixels[EYES[0]] = c
-        cp.pixels[EYES[1]] = c
-        cp.pixels.show()
-        tone(420 - k * 6)
-        time.sleep(0.05)
+def boo():
+    """Sudden darkness and silence ... BOO ... and a slow cackle."""
     quiet()
-    time.sleep(random.uniform(0.6, 1.4))   # unpredictable pause = real fright
+    ring(OFF)
+    time.sleep(random.uniform(0.6, 1.4))   # an unpredictable pause
     cp.pixels.brightness = SCARE_BRIGHTNESS
-    fill(ORANGE)
-    for f in range(1800, 300, -60):
+    ring(ORANGE)
+    for f in range(1800, 300, -50):        # screech
         tone(f)
-        time.sleep(0.008)
+        time.sleep(0.01)
     for k in range(20):
-        fill(scale(ORANGE, 1 - k / 20))
-        tone(300 - k * 10)
+        ring(scale(ORANGE, 1 - k / 20))
+        tone(300 - 10 * k)
         time.sleep(0.03)
-    quiet()
     cp.pixels.brightness = BRIGHTNESS
-
-
-def cackle():
-    """Alternate the two halves orange/green while the board laughs."""
-    for n in range(8):
-        a, b = (ORANGE, GREEN) if n % 2 else (GREEN, ORANGE)
-        for i in range(10):
-            cp.pixels[i] = a if i < 5 else b
+    for n in range(6):                     # "HA ... HA ... HA": the halves
+        for i in range(10):                # swap at most 3 times a second
+            cp.pixels[i] = ORANGE if (i < 5) == (n % 2 == 0) else GREEN
         cp.pixels.show()
-        tone(520 if n % 2 else 440)
-        time.sleep(0.12)
+        tone(523 - 26 * n)
+        time.sleep(0.2)
         quiet()
-        time.sleep(0.04)
-    fill(OFF)
+        time.sleep(MIN_FLASH_GAP - 0.2)
+    ring(OFF)
 
 
-def scare():
-    effects = [heartbeat, comet, lightning, possessed]
-    first = random.choice(effects)
-    effects.remove(first)
-    first()
-    random.choice(effects)()
-    eyes_jumpscare()
-    cackle()
-    quiet()
+def awaken():
+    """The accelerometer woke it: slow glow -> flashy -> scratchy -> BOO."""
+    j = random.uniform(0.8, 1.2)           # never quite the same length twice
+    slow_glow(GLOW_TIME * j)
+    flashy(FLASH_TIME * j)
+    scratchy(SCRATCH_TIME * j)
+    boo()
 
 
+# ---------------------------------------------------------------- game
 def win():
     for f in (523, 659, 784, 1047):
         for _ in range(4):
@@ -245,9 +286,9 @@ def win():
             tone(f)
             time.sleep(0.05)
     quiet()
-    fill(scale(GREEN, 0.4))
+    ring(scale(GREEN, 0.4))
     time.sleep(0.6)
-    fill(OFF)
+    ring(OFF)
 
 
 def show_level():
@@ -261,7 +302,6 @@ def show_level():
     time.sleep(0.8)
 
 
-# ---------------------------------------------------------------- game
 def candy_round():
     """Countdown, then the player must grab candy without shaking the table.
     Every survived round makes the pumpkin more sensitive."""
@@ -281,8 +321,8 @@ def candy_round():
         left = SNEAK_TIME - (time.monotonic() - t0)
         if left <= 0:
             break
-        if vibration():
-            scare()
+        if knocked():
+            awaken()
             level = 1
             set_sensitivity()
             return
@@ -298,29 +338,9 @@ def candy_round():
     show_level()
 
 
-next_eyes = time.monotonic() + 5
-eyes_until = 0.0
-
-
-def idle_frame(t):
-    """Flickering jack-o'-lantern glow; now and then the eyes open."""
-    global next_eyes, eyes_until
-    breath = 0.25 + 0.12 * math.sin(t * 1.7)
-    for i in range(10):
-        cp.pixels[i] = scale(ORANGE, breath * (0.7 + 0.3 * random.random()))
-    if t >= next_eyes:
-        eyes_until = t + 1.6
-        next_eyes = t + random.uniform(6, 14)
-    if t < eyes_until:
-        blink = 0.7 < eyes_until - t < 0.82
-        for e in EYES:
-            cp.pixels[e] = OFF if blink else GREEN
-    cp.pixels.show()
-
-
 # ---------------------------------------------------------------- main
 set_sensitivity()
-fill(OFF)
+ring(OFF)
 rearm(2.0)
 prev_a = prev_b = False
 
@@ -334,8 +354,8 @@ while True:
     elif b and not prev_b:
         candy_round()
         rearm()
-    elif vibration() or (SHADOW_TRIGGER and shadow()):
-        scare()
+    elif knocked():
+        awaken()
         rearm(2.0)
     else:
         idle_frame(time.monotonic())
